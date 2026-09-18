@@ -1,3 +1,4 @@
+```yaml
 name: Android Release
 
 on:
@@ -45,9 +46,8 @@ jobs:
           New-Item -ItemType Directory -Force $keystoreDir | Out-Null
 
           try {
-            $bytes = [Convert]::FromBase64String(
-              ($env:RYZA_KEYSTORE_B64 -replace '\s', '')
-            )
+            $base64 = $env:RYZA_KEYSTORE_B64 -replace '\s', ''
+            $bytes = [Convert]::FromBase64String($base64)
 
             [System.IO.File]::WriteAllBytes(
               $keystorePath,
@@ -100,9 +100,89 @@ jobs:
 
           Write-Host "Media restore completed."
 
+      - name: Setup Android toolchain
+        shell: powershell
+        run: |
+          Write-Host "Running project Android toolchain setup..."
+
+          powershell -ExecutionPolicy Bypass `
+            -File scripts/setup_android_tools.ps1
+
+          $tools = Join-Path $PWD ".android-tools"
+          $jdk = Join-Path $tools "jdk17"
+          $sdk = Join-Path $tools "android-sdk"
+          $sm  = Join-Path $sdk "cmdline-tools\latest\bin\sdkmanager.bat"
+
+          $javac = Join-Path $jdk "bin\javac.exe"
+          $aapt2 = Join-Path $sdk "build-tools\34.0.0\aapt2.exe"
+          $androidJar = Join-Path $sdk "platforms\android-34\android.jar"
+
+          Write-Host ""
+          Write-Host "Checking Android toolchain..."
+          Write-Host "Javac:      $javac"
+          Write-Host "AAPT2:      $aapt2"
+          Write-Host "Android.jar:$androidJar"
+          Write-Host "SDKManager: $sm"
+          Write-Host ""
+
+          # The upstream setup script can finish without failing the step
+          # even when sdkmanager failed. Therefore verify ourselves.
+          if (-not (Test-Path $sm)) {
+            throw "sdkmanager.bat was not found: $sm"
+          }
+
+          if (-not (Test-Path $javac)) {
+            throw "JDK 17 was not installed correctly: $javac"
+          }
+
+          $env:JAVA_HOME = $jdk
+          $env:Path = "$jdk\bin;$env:Path"
+
+          # If build-tools are missing, explicitly install them again.
+          if (-not (Test-Path $aapt2)) {
+            Write-Host "AAPT2 is missing. Installing Android packages explicitly..."
+
+            Write-Host "Accepting Android SDK licenses..."
+            $licenseInput = 1..200 | ForEach-Object { "y" }
+
+            $licenseInput | & $sm --sdk_root="$sdk" --licenses
+
+            Write-Host "Installing required Android packages..."
+
+            & $sm `
+              --sdk_root="$sdk" `
+              "platform-tools" `
+              "platforms;android-34" `
+              "build-tools;34.0.0"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "sdkmanager failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Final toolchain verification..."
+
+          if (-not (Test-Path $aapt2)) {
+            throw "AAPT2 is still missing: $aapt2"
+          }
+
+          if (-not (Test-Path $androidJar)) {
+            throw "android.jar is still missing: $androidJar"
+          }
+
+          Write-Host "Android toolchain is ready."
+
+          & $javac -version
+          & $aapt2 version
+
       - name: Show restored media
         shell: powershell
         run: |
+          if (-not (Test-Path "web/assets")) {
+            throw "web/assets does not exist after media restore."
+          }
+
           $files = Get-ChildItem "web/assets" -Recurse -File |
             Where-Object {
               $_.Extension.ToLower() -in @(
@@ -129,16 +209,6 @@ jobs:
             Sort-Object Name |
             Format-Table Name, Count
 
-      - name: Setup Android toolchain
-        shell: powershell
-        run: |
-          powershell -ExecutionPolicy Bypass `
-            -File scripts/setup_android_tools.ps1
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Android toolchain setup failed."
-          }
-
       - name: Build APK
         shell: powershell
         run: |
@@ -159,12 +229,30 @@ jobs:
             throw "APK was not found."
           }
 
-          $sizeMB = [math]::Round($apk.Length / 1MB, 1)
+          $sizeMB = [math]::Round(
+            $apk.Length / 1MB,
+            1
+          )
 
           Write-Host "======================================"
           Write-Host "APK: $($apk.FullName)"
           Write-Host "Size: $sizeMB MB"
           Write-Host "======================================"
+
+      - name: Verify APK signature
+        shell: powershell
+        run: |
+          $apk = Get-ChildItem "output/android/RyzaChat-*.apk" |
+            Select-Object -First 1
+
+          $tools = Join-Path $PWD ".android-tools"
+          $apksigner = Join-Path $tools "android-sdk\build-tools\34.0.0\apksigner.bat"
+
+          & $apksigner verify --verbose $apk.FullName
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "APK signature verification failed."
+          }
 
       - name: Create GitHub Release and upload APK
         shell: powershell
@@ -176,9 +264,6 @@ jobs:
             throw "APK not found for release."
           }
 
-          # 每次 master 构建创建一个独立 Release。
-          # 例如：
-          # ryza-v1.2.15-build.37
           $tag = "ryza-v$env:RYZA_VERSION-build.$env:GITHUB_RUN_NUMBER"
           $title = "Ryza Chat $env:RYZA_VERSION (Build $env:GITHUB_RUN_NUMBER)"
 
@@ -196,3 +281,4 @@ jobs:
           }
 
           Write-Host "Release published successfully."
+```
