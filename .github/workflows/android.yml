@@ -1,4 +1,3 @@
-```yaml
 name: Android Release
 
 on:
@@ -281,4 +280,3 @@ jobs:
           }
 
           Write-Host "Release published successfully."
-```
