@@ -21,10 +21,112 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Configure Android toolchain
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Configuring GitHub Runner Android SDK"
+          Write-Host "======================================"
+
+          $runnerSdk = $env:ANDROID_HOME
+          $runnerJdk = $env:JAVA_HOME
+
+          if ([string]::IsNullOrWhiteSpace($runnerSdk)) {
+            throw "ANDROID_HOME is not set."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($runnerJdk)) {
+            throw "JAVA_HOME is not set."
+          }
+
+          Write-Host "Runner SDK: $runnerSdk"
+          Write-Host "Runner JDK: $runnerJdk"
+
+          $toolsRoot = Join-Path $PWD ".android-tools"
+          $sdkLink = Join-Path $toolsRoot "android-sdk"
+          $jdkLink = Join-Path $toolsRoot "jdk17"
+
+          New-Item -ItemType Directory -Force $toolsRoot | Out-Null
+
+          if (Test-Path $sdkLink) {
+            Remove-Item -Recurse -Force $sdkLink
+          }
+
+          if (Test-Path $jdkLink) {
+            Remove-Item -Recurse -Force $jdkLink
+          }
+
+          # build_apk.ps1 expects:
+          #
+          # .android-tools/
+          #   ├── android-sdk/
+          #   └── jdk17/
+          #
+          # Use Windows directory junctions instead of copying the SDK/JDK.
+          New-Item `
+            -ItemType Junction `
+            -Path $sdkLink `
+            -Target $runnerSdk | Out-Null
+
+          New-Item `
+            -ItemType Junction `
+            -Path $jdkLink `
+            -Target $runnerJdk | Out-Null
+
+          # Tell build_apk.ps1 to use this directory.
+          "RYZA_ANDROID_TOOLS=$toolsRoot" >> $env:GITHUB_ENV
+
+          $aapt2 = Join-Path $sdkLink "build-tools\34.0.0\aapt2.exe"
+          $aapt = Join-Path $sdkLink "build-tools\34.0.0\aapt.exe"
+          $d8 = Join-Path $sdkLink "build-tools\34.0.0\d8.bat"
+          $zipalign = Join-Path $sdkLink "build-tools\34.0.0\zipalign.exe"
+          $apksigner = Join-Path $sdkLink "build-tools\34.0.0\apksigner.bat"
+          $androidJar = Join-Path $sdkLink "platforms\android-34\android.jar"
+          $javac = Join-Path $jdkLink "bin\javac.exe"
+
+          Write-Host ""
+          Write-Host "Checking required tools..."
+          Write-Host "AAPT2:       $aapt2"
+          Write-Host "AAPT:        $aapt"
+          Write-Host "D8:          $d8"
+          Write-Host "Zipalign:    $zipalign"
+          Write-Host "Apksigner:   $apksigner"
+          Write-Host "Android.jar: $androidJar"
+          Write-Host "Javac:       $javac"
+          Write-Host ""
+
+          $required = @(
+            $aapt2,
+            $aapt,
+            $d8,
+            $zipalign,
+            $apksigner,
+            $androidJar,
+            $javac
+          )
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) {
+              throw "Required Android tool is missing: $file"
+            }
+          }
+
+          Write-Host "Android toolchain verification passed."
+
+          & $javac -version
+          & $aapt2 version
+
       - name: Read version
         shell: powershell
         run: |
-          $versionInfo = Get-Content "config/version.json" -Raw | ConvertFrom-Json
+          $versionInfo = Get-Content "config/version.json" -Raw |
+            ConvertFrom-Json
 
           "RYZA_VERSION=$($versionInfo.version)" >> $env:GITHUB_ENV
           "RYZA_VERSION_CODE=$($versionInfo.code)" >> $env:GITHUB_ENV
@@ -42,7 +144,10 @@ jobs:
           $keystoreDir = "android/keystore"
           $keystorePath = Join-Path $keystoreDir "ryza.keystore"
 
-          New-Item -ItemType Directory -Force $keystoreDir | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            $keystoreDir | Out-Null
 
           try {
             $base64 = $env:RYZA_KEYSTORE_B64 -replace '\s', ''
@@ -97,123 +202,15 @@ jobs:
             throw "restore_media.py failed."
           }
 
-          Write-Host "Media restore completed."
-
-      - name: Setup Android toolchain
-        shell: powershell
-        run: |
-          Write-Host "Running project Android toolchain setup..."
-
-          powershell -ExecutionPolicy Bypass `
-            -File scripts/setup_android_tools.ps1
-
-          $tools = Join-Path $PWD ".android-tools"
-          $jdk = Join-Path $tools "jdk17"
-          $sdk = Join-Path $tools "android-sdk"
-          $sm  = Join-Path $sdk "cmdline-tools\latest\bin\sdkmanager.bat"
-
-          $javac = Join-Path $jdk "bin\javac.exe"
-          $aapt2 = Join-Path $sdk "build-tools\34.0.0\aapt2.exe"
-          $androidJar = Join-Path $sdk "platforms\android-34\android.jar"
-
-          if (-not (Test-Path $sm)) {
-            throw "sdkmanager.bat not found: $sm"
-          }
-
-          if (-not (Test-Path $javac)) {
-            throw "JDK 17 not found: $javac"
-          }
-
-          $env:JAVA_HOME = $jdk
-          $env:Path = "$jdk\bin;$env:Path"
-
-          Write-Host ""
-          Write-Host "Accepting Android SDK licenses..."
-
-          # sdkmanager requires `y`, not `yes`.
-          # Use a real stdin stream instead of a PowerShell pipe.
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "cmd.exe"
-          $psi.Arguments = "/d /s /c `"$sm`" --sdk_root=`"$sdk`" --licenses"
-          $psi.UseShellExecute = $false
-          $psi.RedirectStandardInput = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $psi.CreateNoWindow = $true
-
-          $process = New-Object System.Diagnostics.Process
-          $process.StartInfo = $psi
-
-          [void]$process.Start()
-
-          # Feed a large number of `y` answers.
-          $process.StandardInput.Write(
-            (("y`r`n") * 200)
-          )
-          $process.StandardInput.Close()
-
-          $stdout = $process.StandardOutput.ReadToEnd()
-          $stderr = $process.StandardError.ReadToEnd()
-
-          $process.WaitForExit()
-
-          Write-Host $stdout
-
-          if ($stderr) {
-            Write-Host $stderr
-          }
-
-          if ($process.ExitCode -ne 0) {
-            throw "sdkmanager --licenses failed with exit code $($process.ExitCode)"
-          }
-
-          Write-Host "Android SDK licenses accepted."
-
-          Write-Host ""
-          Write-Host "Installing required Android SDK packages..."
-
-          & $sm `
-            --sdk_root="$sdk" `
-            "platform-tools" `
-            "platforms;android-34" `
-            "build-tools;34.0.0"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "sdkmanager package installation failed with exit code $LASTEXITCODE"
-          }
-
-          Write-Host ""
-          Write-Host "Final toolchain verification..."
-
-          if (-not (Test-Path $aapt2)) {
-            throw "AAPT2 is still missing: $aapt2"
-          }
-
-          if (-not (Test-Path $androidJar)) {
-            throw "android.jar is still missing: $androidJar"
-          }
-
-          if (-not (Test-Path $javac)) {
-            throw "javac is missing: $javac"
-          }
-
-          Write-Host "======================================"
-          Write-Host "Android toolchain is ready."
-          Write-Host "AAPT2:       $aapt2"
-          Write-Host "Android.jar: $androidJar"
-          Write-Host "Javac:       $javac"
-          Write-Host "======================================"
-
-          & $javac -version
-          & $aapt2 version
-
-      - name: Show restored media
-        shell: powershell
-        run: |
           if (-not (Test-Path "web/assets")) {
             throw "web/assets does not exist after media restore."
           }
 
+          Write-Host "Media restore completed."
+
+      - name: Show restored media
+        shell: powershell
+        run: |
           $files = Get-ChildItem "web/assets" -Recurse -File |
             Where-Object {
               $_.Extension.ToLower() -in @(
@@ -235,6 +232,10 @@ jobs:
 
           Write-Host "Restored media file count: $($files.Count)"
 
+          if ($files.Count -eq 0) {
+            throw "No media files were restored."
+          }
+
           $files |
             Group-Object Extension |
             Sort-Object Name |
@@ -253,7 +254,8 @@ jobs:
       - name: Verify APK
         shell: powershell
         run: |
-          $apk = Get-ChildItem "output/android/RyzaChat-*.apk" |
+          $apk = Get-ChildItem `
+            "output/android/RyzaChat-*.apk" |
             Select-Object -First 1
 
           if (-not $apk) {
@@ -266,18 +268,20 @@ jobs:
           )
 
           Write-Host "======================================"
-          Write-Host "APK: $($apk.FullName)"
+          Write-Host "APK:  $($apk.FullName)"
           Write-Host "Size: $sizeMB MB"
           Write-Host "======================================"
 
       - name: Verify APK signature
         shell: powershell
         run: |
-          $apk = Get-ChildItem "output/android/RyzaChat-*.apk" |
+          $apk = Get-ChildItem `
+            "output/android/RyzaChat-*.apk" |
             Select-Object -First 1
 
-          $tools = Join-Path $PWD ".android-tools"
-          $apksigner = Join-Path $tools "android-sdk\build-tools\34.0.0\apksigner.bat"
+          $apksigner = Join-Path `
+            $env:RYZA_ANDROID_TOOLS `
+            "android-sdk\build-tools\34.0.0\apksigner.bat"
 
           & $apksigner verify --verbose $apk.FullName
 
@@ -288,7 +292,8 @@ jobs:
       - name: Create GitHub Release and upload APK
         shell: powershell
         run: |
-          $apk = Get-ChildItem "output/android/RyzaChat-*.apk" |
+          $apk = Get-ChildItem `
+            "output/android/RyzaChat-*.apk" |
             Select-Object -First 1
 
           if (-not $apk) {
@@ -311,4 +316,7 @@ jobs:
             throw "GitHub Release creation failed."
           }
 
-          Write-Host "Release published successfully."
+          Write-Host "======================================"
+          Write-Host "GitHub Release created successfully."
+          Write-Host "Tag: $tag"
+          Write-Host "======================================"
