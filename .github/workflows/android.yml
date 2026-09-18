@@ -116,47 +116,70 @@ jobs:
           $aapt2 = Join-Path $sdk "build-tools\34.0.0\aapt2.exe"
           $androidJar = Join-Path $sdk "platforms\android-34\android.jar"
 
-          Write-Host ""
-          Write-Host "Checking Android toolchain..."
-          Write-Host "Javac:      $javac"
-          Write-Host "AAPT2:      $aapt2"
-          Write-Host "Android.jar:$androidJar"
-          Write-Host "SDKManager: $sm"
-          Write-Host ""
-
-          # The upstream setup script can finish without failing the step
-          # even when sdkmanager failed. Therefore verify ourselves.
           if (-not (Test-Path $sm)) {
-            throw "sdkmanager.bat was not found: $sm"
+            throw "sdkmanager.bat not found: $sm"
           }
 
           if (-not (Test-Path $javac)) {
-            throw "JDK 17 was not installed correctly: $javac"
+            throw "JDK 17 not found: $javac"
           }
 
           $env:JAVA_HOME = $jdk
           $env:Path = "$jdk\bin;$env:Path"
 
-          # If build-tools are missing, explicitly install them again.
-          if (-not (Test-Path $aapt2)) {
-            Write-Host "AAPT2 is missing. Installing Android packages explicitly..."
+          Write-Host ""
+          Write-Host "Accepting Android SDK licenses..."
 
-            Write-Host "Accepting Android SDK licenses..."
-            $licenseInput = 1..200 | ForEach-Object { "y" }
+          # sdkmanager requires `y`, not `yes`.
+          # Use a real stdin stream instead of a PowerShell pipe.
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "cmd.exe"
+          $psi.Arguments = "/d /s /c `"$sm`" --sdk_root=`"$sdk`" --licenses"
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.CreateNoWindow = $true
 
-            $licenseInput | & $sm --sdk_root="$sdk" --licenses
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
 
-            Write-Host "Installing required Android packages..."
+          [void]$process.Start()
 
-            & $sm `
-              --sdk_root="$sdk" `
-              "platform-tools" `
-              "platforms;android-34" `
-              "build-tools;34.0.0"
+          # Feed a large number of `y` answers.
+          $process.StandardInput.Write(
+            (("y`r`n") * 200)
+          )
+          $process.StandardInput.Close()
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "sdkmanager failed with exit code $LASTEXITCODE"
-            }
+          $stdout = $process.StandardOutput.ReadToEnd()
+          $stderr = $process.StandardError.ReadToEnd()
+
+          $process.WaitForExit()
+
+          Write-Host $stdout
+
+          if ($stderr) {
+            Write-Host $stderr
+          }
+
+          if ($process.ExitCode -ne 0) {
+            throw "sdkmanager --licenses failed with exit code $($process.ExitCode)"
+          }
+
+          Write-Host "Android SDK licenses accepted."
+
+          Write-Host ""
+          Write-Host "Installing required Android SDK packages..."
+
+          & $sm `
+            --sdk_root="$sdk" `
+            "platform-tools" `
+            "platforms;android-34" `
+            "build-tools;34.0.0"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "sdkmanager package installation failed with exit code $LASTEXITCODE"
           }
 
           Write-Host ""
@@ -170,7 +193,16 @@ jobs:
             throw "android.jar is still missing: $androidJar"
           }
 
+          if (-not (Test-Path $javac)) {
+            throw "javac is missing: $javac"
+          }
+
+          Write-Host "======================================"
           Write-Host "Android toolchain is ready."
+          Write-Host "AAPT2:       $aapt2"
+          Write-Host "Android.jar: $androidJar"
+          Write-Host "Javac:       $javac"
+          Write-Host "======================================"
 
           & $javac -version
           & $aapt2 version
