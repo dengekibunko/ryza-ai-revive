@@ -1,0 +1,198 @@
+name: Android Release
+
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      MEDIA_REPO: zeroa234/ryza-ai-revive
+      GH_TOKEN: ${{ github.token }}
+      RYZA_KEYSTORE_B64: ${{ secrets.RYZA_KEYSTORE_B64 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        shell: powershell
+        run: |
+          $versionInfo = Get-Content "config/version.json" -Raw | ConvertFrom-Json
+
+          "RYZA_VERSION=$($versionInfo.version)" >> $env:GITHUB_ENV
+          "RYZA_VERSION_CODE=$($versionInfo.code)" >> $env:GITHUB_ENV
+
+          Write-Host "Version: $($versionInfo.version)"
+          Write-Host "Version code: $($versionInfo.code)"
+
+      - name: Restore fixed signing keystore
+        shell: powershell
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RYZA_KEYSTORE_B64)) {
+            throw "RYZA_KEYSTORE_B64 repository secret is missing."
+          }
+
+          $keystoreDir = "android/keystore"
+          $keystorePath = Join-Path $keystoreDir "ryza.keystore"
+
+          New-Item -ItemType Directory -Force $keystoreDir | Out-Null
+
+          try {
+            $bytes = [Convert]::FromBase64String(
+              ($env:RYZA_KEYSTORE_B64 -replace '\s', '')
+            )
+
+            [System.IO.File]::WriteAllBytes(
+              $keystorePath,
+              $bytes
+            )
+          }
+          catch {
+            throw "RYZA_KEYSTORE_B64 is not valid Base64."
+          }
+
+          if (-not (Test-Path $keystorePath)) {
+            throw "Keystore was not created."
+          }
+
+          Write-Host "Fixed signing keystore restored."
+
+      - name: Download media seed APK
+        shell: powershell
+        run: |
+          $apkName = "RyzaChat-$env:RYZA_VERSION.apk"
+
+          Write-Host "Downloading $apkName from $env:MEDIA_REPO ..."
+
+          gh release download "v$env:RYZA_VERSION" `
+            --repo $env:MEDIA_REPO `
+            --pattern $apkName `
+            --output $apkName `
+            --clobber
+
+          if (-not (Test-Path $apkName)) {
+            throw "Media seed APK was not downloaded."
+          }
+
+          $sizeMB = [math]::Round(
+            (Get-Item $apkName).Length / 1MB,
+            1
+          )
+
+          Write-Host "Downloaded seed APK: $sizeMB MB"
+
+      - name: Restore media
+        shell: powershell
+        run: |
+          python scripts/restore_media.py `
+            "RyzaChat-$env:RYZA_VERSION.apk"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "restore_media.py failed."
+          }
+
+          Write-Host "Media restore completed."
+
+      - name: Show restored media
+        shell: powershell
+        run: |
+          $files = Get-ChildItem "web/assets" -Recurse -File |
+            Where-Object {
+              $_.Extension.ToLower() -in @(
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+                ".gif",
+                ".m4a",
+                ".mp3",
+                ".wav",
+                ".ogg",
+                ".aac",
+                ".skel",
+                ".ttf",
+                ".otf"
+              )
+            }
+
+          Write-Host "Restored media file count: $($files.Count)"
+
+          $files |
+            Group-Object Extension |
+            Sort-Object Name |
+            Format-Table Name, Count
+
+      - name: Setup Android toolchain
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass `
+            -File scripts/setup_android_tools.ps1
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Android toolchain setup failed."
+          }
+
+      - name: Build APK
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass `
+            -File scripts/build_apk.ps1
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "APK build failed."
+          }
+
+      - name: Verify APK
+        shell: powershell
+        run: |
+          $apk = Get-ChildItem "output/android/RyzaChat-*.apk" |
+            Select-Object -First 1
+
+          if (-not $apk) {
+            throw "APK was not found."
+          }
+
+          $sizeMB = [math]::Round($apk.Length / 1MB, 1)
+
+          Write-Host "======================================"
+          Write-Host "APK: $($apk.FullName)"
+          Write-Host "Size: $sizeMB MB"
+          Write-Host "======================================"
+
+      - name: Create GitHub Release and upload APK
+        shell: powershell
+        run: |
+          $apk = Get-ChildItem "output/android/RyzaChat-*.apk" |
+            Select-Object -First 1
+
+          if (-not $apk) {
+            throw "APK not found for release."
+          }
+
+          # 每次 master 构建创建一个独立 Release。
+          # 例如：
+          # ryza-v1.2.15-build.37
+          $tag = "ryza-v$env:RYZA_VERSION-build.$env:GITHUB_RUN_NUMBER"
+          $title = "Ryza Chat $env:RYZA_VERSION (Build $env:GITHUB_RUN_NUMBER)"
+
+          Write-Host "Creating release: $tag"
+
+          gh release create "$tag" `
+            "$($apk.FullName)" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --title "$title" `
+            --generate-notes `
+            --target "$env:GITHUB_SHA"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release creation failed."
+          }
+
+          Write-Host "Release published successfully."
