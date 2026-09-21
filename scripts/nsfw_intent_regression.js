@@ -31,6 +31,7 @@ vm.createContext(sandbox);
 function load(f) {
   vm.runInContext(fs.readFileSync(path.join(WEB, 'js', f), 'utf8'), sandbox, { filename: f });
 }
+load('util.js');   // core: owns the emotion/attitude vocabulary api.js validates tags against
 load('nsfw.js');
 load('api.js');
 
@@ -39,6 +40,22 @@ ok(!!N && N.VARIANT === 'nsfw', 'Nsfw exported');
 ok(typeof N.detect !== 'function', 'no keyword detector');
 ok(typeof N.decide !== 'function', 'no keyword decide');
 ok(typeof N.promptSection !== 'function', 'policy is not duplicated in nsfw.js');
+
+/* One owner for the emotion vocabulary: api.js (io) and avatar.js (render)
+   cannot import each other, so core (util.js) holds it. Identity, not just
+   equality — a re-declared list with the same contents is the bug. */
+ok(sandbox.Api.EMOTIONS === sandbox.Util.EMOTIONS,
+   'api.js validates against core\'s emotion list (no second literal)');
+ok(sandbox.Api.ATTITUDES === sandbox.Util.ATTITUDES,
+   'api.js validates against core\'s attitude list');
+
+/* The renderer is a port now (nsfw/core must not reference avatar/render).
+   Wiring it here is the same call app.js makes; before the port, nsfw.js read
+   `global.Avatar` itself — an edge the boundary guard could not see. */
+N.setSink(function (name) { sandbox.Avatar.setAtlasVariant(name); });
+let sinkCalls = 0;
+const realSink = sandbox.Avatar.setAtlasVariant.bind(sandbox.Avatar);
+sandbox.Avatar.setAtlasVariant = function (name) { sinkCalls++; return realSink(name); };
 
 N.reset();
 ok(/着ている/.test(N.screenFact()), 'screenFact: dressed');
@@ -62,6 +79,15 @@ ok(N.active() === false, 'disabled blocks llm re-enable');
 N.setEnabled(true);
 N.reset();
 ok(N.active() === false && sandbox.Avatar._calls.pop() === 'default', 'reset → default');
+ok(sinkCalls >= 3, 'the injected sink is what performs the atlas switch');
+
+/* The port is the only path to the renderer: nsfw.js must not name Avatar at
+   all. This is the assertion that would have caught the original leak (a
+   core->render edge written as `global.Avatar`, which the layering guard could
+   not see because the reference has no trailing dot). */
+const nsfwSrc = fs.readFileSync(path.join(WEB, 'js', 'nsfw.js'), 'utf8')
+  .replace(/\/\*[\s\S]*?\*\//g, ' ');
+ok(!/\bAvatar\b/.test(nsfwSrc), 'nsfw.js never names the renderer');
 
 const A = sandbox.Api;
 if (A && A.parseTaggedReply) {
@@ -221,24 +247,65 @@ ok(A._localProxy(A._qwenHttpsUrl('http://dashscope-result-bj.oss-cn-beijing.aliy
      .indexOf('https%3A') >= 0,
    'proxied OSS download is https');
 
-/* --- Fish Audio Open API: host normalize + local-sample clone --- */
+/* --- Fish Audio: host normalize + local-sample clone ---
+   The site that has the free engine is fish.audio (api.fish.audio);
+   fishaudio.org is a different service with the same product name, its keys
+   are not interchangeable, and an EMPTY field used to resolve to it. Blank now
+   means the official current API (2026-09-21 report on the 1.2.20 APK), and a
+   legacy deployment is still reachable by typing its host — never by rewrite. */
 const FISH = 'https://fishaudio.org/api/open/v1';
+const FISH_OFFICIAL = 'https://api.fish.audio';
 ok(!A.FISH_DEFAULT_VOICE, 'no shipped Fish voice id (clone from local samples)');
 ok(A._fishSampleUrls().indexOf('assets/audio/prologue/jp/prologue_08.m4a') >= 0,
    'clone candidates include JP prologue m4a');
 ok(A._fishSampleUrls().indexOf('assets/voice/ryza_wav/prologue_08.wav') >= 0,
    'clone candidates include converted wav');
 ok(A.FISH_TTS_MODELS.indexOf('fishaudio-s21pro-flash') >= 0, 'seed includes s21pro-flash');
-ok(A._fishApiRoot('') === FISH, 'empty Fish base → official Open API v1');
-ok(A._fishApiRoot('https://fishaudio.org/') === FISH, 'site root → /api/open/v1');
+ok(A.FISH_TTS_MODELS.indexOf('s2.1-pro-free') >= 0, 'seed includes the free modern engine');
+ok(A._fishApiRoot('') === FISH_OFFICIAL, 'empty Fish base → official current API');
+ok(A._fishApiRoot('https://fishaudio.org/') === FISH, 'a typed legacy site root → /api/open/v1');
 ok(A._fishApiRoot('https://fishaudio.org/api/open/v1/') === FISH, 'trailing slash stripped');
 ok(A._fishApiRoot('https://fishaudio.org/api/open/v1/speech/tts') === FISH,
    'pasted TTS path stripped to root');
 ok(A._fishApiRoot('https://fishaudio.org/v1') === FISH, 'compat /v1 → Open API v1');
-ok(A._fishApiRoot('https://api.fish.audio/v1') === FISH, 'legacy api.fish.audio remapped');
 ok(A._fishApiRoot('https://fishaudio.org/api/open/v3') ===
    'https://fishaudio.org/api/open/v3', 'explicit v3 root kept');
-ok(A._fishTtsUrl('') === FISH + '/speech/tts', 'TTS path is /speech/tts');
+ok(A._fishTtsUrl('https://fishaudio.org') === FISH + '/speech/tts',
+   'the legacy surface still speaks /speech/tts');
+
+/* --- the two Fish surfaces (issues #6 / #7) --------------------------------
+   Pasting the documented https://api.fish.audio used to be silently rewritten
+   to the older host, so the key went somewhere it does not work and the user
+   got a confusing failure. The base now picks the surface and stays put. */
+const FISH_MODERN = A.FISH_MODERN_BASE;
+ok(A._fishApiRoot('https://api.fish.audio') === FISH_MODERN,
+   'api.fish.audio is kept, not remapped to the old host');
+ok(A._fishApiRoot('https://api.fish.audio/v1') === FISH_MODERN,
+   'api.fish.audio/v1 → modern root');
+ok(A._fishApiRoot('https://api.fish.audio/v1/tts') === FISH_MODERN,
+   'pasted modern TTS path stripped to root');
+ok(A._fishApiStyle(FISH_MODERN) === 'modern' && A._fishApiStyle(FISH) === 'legacy',
+   'style follows from the resolved root');
+ok(A._fishTtsUrl(FISH_OFFICIAL) === FISH_OFFICIAL + '/v1/tts',
+   'modern TTS path is /v1/tts');
+ok(A._fishTtsUrl('') === FISH_OFFICIAL + '/v1/tts' &&
+   A._fishApiStyle(A._fishApiRoot('')) === 'modern',
+   'an empty base speaks the CURRENT surface (the free engine lives there)');
+ok(A._fishVoiceFor({ fishVoice: 'n', fishVoiceAsmr: 'a' }, 'asmr') === 'a' &&
+   A._fishVoiceFor({ fishVoice: 'n', fishVoiceAsmr: 'a' }, 'chat') === 'n',
+   'ASMR has its own voice id, everything else the normal one');
+ok(A._localProxy(A._fishTtsUrl(FISH_MODERN)).indexOf('/_proxy?u=') === 0 &&
+   A._localProxy(A._fishTtsUrl(FISH_MODERN)).indexOf('api.fish.audio') > 0,
+   'modern TTS still goes through /_proxy, to the host the user typed');
+ok(/401/.test(A._fishErrorMessage(401, '', 'k')) &&
+   /key/i.test(A._fishErrorMessage(401, '', 'k')),
+   '401 is reported as a key problem, not a generic failure');
+ok(!/SECRET-KEY/.test(A._fishErrorMessage(400, '{"message":"bad SECRET-KEY"}', 'SECRET-KEY')),
+   'the key is redacted out of an echoed error body');
+ok(/403/.test(A._fishErrorMessage(403, '', 'k')) &&
+   /权限|permission/i.test(A._fishErrorMessage(403, '', 'k')),
+   '403 names permission/model access and carries the status');
+
 ok(A._fishLanguage('ja') === 'ja' && A._fishLanguage('zh-tw') === 'zh-TW',
    'Fish language codes');
 ok(A._localProxy(A._fishTtsUrl('')).indexOf('/_proxy?u=') === 0,

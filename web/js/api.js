@@ -3,9 +3,14 @@
 (function (global) {
   'use strict';
 
-  var EMOTIONS = ['neutral', 'happy', 'laughing', 'tease', 'shy',
-                  'cuddle', 'sad', 'crying', 'angry'];
-  var ATTITUDES = ['agree', 'deny', 'question'];
+  /* The emotion/attitude vocabulary lives in core (util.js) because this module
+     (io) and avatar.js (render) must agree on it and neither may import the
+     other. Resolved once at load — util.js is loaded first in every host and in
+     the regressions that exercise tag parsing; an empty list would fail those
+     assertions loudly rather than silently drop tags. */
+  var VOCAB = global.Util || {};
+  var EMOTIONS = VOCAB.EMOTIONS || [];
+  var ATTITUDES = VOCAB.ATTITUDES || [];
 
   /* Shipped DEFAULTS placeholders — never send these upstream (the server
      answers with a bare "unsupported model tts-model"); speak() rejects
@@ -122,6 +127,14 @@
     } catch (e) { return false; }
   }
 
+  /* What is on screen now, injected by the host (app.js reads Avatar's public
+     getters). This used to read `window.Avatar._emotion` directly: a private
+     field of the render layer, reached through a qualified global with no
+     trailing dot — invisible to the boundary guard, and an io->render edge the
+     architecture forbids. Absent reader = the defaults below, so api.js still
+     loads alone (nsfw_intent_regression does exactly that). */
+  var _screenState = null;   /* fn() -> { emotion, attitude } */
+
   /* First-line machine prefix filled with what's already on screen, so a
      copy-paste with no edits is a valid no-op. Screen fields live here;
      bags / exp / money / quest / memory stay in trailing <state>. */
@@ -132,10 +145,10 @@
     var stage = 'stage_01_001_04';
     var tod = 'aft';
     try {
-      var av = window.Avatar;
-      if (av) {
-        if (av._emotion && EMOTIONS.indexOf(av._emotion) !== -1) emotion = av._emotion;
-        if (av._attitude && ATTITUDES.indexOf(av._attitude) !== -1) attitude = av._attitude;
+      var scr = _screenState && _screenState();
+      if (scr) {
+        if (scr.emotion && EMOTIONS.indexOf(scr.emotion) !== -1) emotion = scr.emotion;
+        if (scr.attitude && ATTITUDES.indexOf(scr.attitude) !== -1) attitude = scr.attitude;
       }
     } catch (e) {}
     try {
@@ -328,6 +341,62 @@
     return String(baseUrl || '').replace(/\/+$/, '') + path;
   }
 
+  /* ------------------------------------------------------------ speech input
+     Speech-to-text through the provider registry's `stt` row. This is transport,
+     which is why it lives here and not in voice.js / stt.js — the voice layer
+     must not know what HTTP is, so stt.js receives this as an injected port.
+
+     The multipart body is assembled by hand instead of with fetch+FormData, so
+     the call keeps the abort/timeout/error vocabulary every other request in
+     this file uses. The three /_proxy hosts forward the incoming Content-Type
+     (including the boundary) and the raw body verbatim, so multipart passes
+     through unmodified — checked in all three: scripts/serve.py,
+     desktop/main.js, android/.../AssetServer.java. That is also why
+     Content-Type is deliberately NOT set by hand below: doing so would drop the
+     boundary parameter and the endpoint would reject the body. */
+  function transcribe(blob, opts) {
+    opts = opts || {};
+    var cred = Providers.sttCredentials(Config.section('stt'));
+    if (!cred.baseUrl) return Promise.reject(new Error('NO_STT_URL'));
+    if (!blob || !blob.size) return Promise.reject(new Error('NO_AUDIO'));
+    var boundary = '----ryza' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    var head = [];
+    function field(name, value) {
+      head.push('--' + boundary + '\r\n' +
+                'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' +
+                value + '\r\n');
+    }
+    if (cred.model) field('model', cred.model);
+    var iso = opts.lang ? Langs.sttLang(opts.lang) : '';
+    if (iso) field('language', iso);
+    field('response_format', 'json');
+    var headText = head.join('') +
+      '--' + boundary + '\r\n' +
+      'Content-Disposition: form-data; name="file"; filename="speech.wav"\r\n' +
+      'Content-Type: audio/wav\r\n\r\n';
+    var body = new Blob([headText, blob, '\r\n--' + boundary + '--\r\n'],
+                        { type: 'multipart/form-data; boundary=' + boundary });
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', localProxy(upstreamUrl(cred.baseUrl, '/audio/transcriptions')), true);
+      xhr.timeout = opts.timeout || 60000;
+      if (cred.apiKey) {
+        xhr.setRequestHeader('Authorization', 'Bearer ' + cred.apiKey);
+        xhr.setRequestHeader('api-key', cred.apiKey);
+      }
+      xhr.onload = function () {
+        var j = null;
+        try { j = JSON.parse(xhr.responseText); } catch (e) {}
+        if (xhrJsonOk(xhr, j)) { resolve(String((j && j.text) || '').trim()); return; }
+        reject(new Error(apiErrorMessage(j, xhr.status, xhr.responseText)));
+      };
+      xhr.onerror = function () { reject(new Error('网络请求失败（跨域或未走本地代理）')); };
+      xhr.ontimeout = function () { reject(new Error('请求超时')); };
+      xhr.onabort = function () { reject(new Error('ABORTED')); };
+      xhr.send(body);
+    });
+  }
+
   /* Three hosts ship a same-origin /_proxy: scripts/serve.py (loopback http),
      the desktop shell (ryza://app — desktop/main.js protocol handler) and the
      Android AssetServer (loopback http). The desktop scheme is a standard
@@ -375,9 +444,45 @@
     return true;
   }
 
-  function request(url, body, apiKey, timeoutMs) {
+  /* --------------------------------------------------------------- turn epoch
+     Every chat call supersedes the previous one: a reply that resolves after
+     the epoch moved on is STALE and must not be applied. That closes AUDIT
+     11.4-3 (the retry bar could fire twice and the two replies could land out
+     of order), and it is the cancellation channel interruption uses — bumping
+     the epoch aborts the XHR still in flight, so an interrupted turn stops
+     costing bandwidth instead of merely being ignored. See web/js/turn.js. */
+  var _epoch = 0;
+  var _inflight = null;      /* { xhr, epoch } */
+
+  function staleError() {
+    var e = new Error('STALE');
+    e.stale = true;
+    return e;
+  }
+
+  function abortInflight(reason) {
+    if (!_inflight) return false;
+    var x = _inflight;
+    _inflight = null;
+    try { x.xhr.abort(); } catch (e) {}
+    return reason != null;
+  }
+
+  /* Local engines (VOICEVOX / AivisSpeech) live on another origin
+     (127.0.0.1:<port>), so they talk to the engine directly instead of going
+     through /_proxy — which only accepts https:// targets by design. The engine
+     has to permit the cross-origin call; when it does not, the error the
+     provider raises says so rather than reporting a bare network failure. */
+  function localFetch(url, opts) {
+    if (typeof fetch !== 'function') return Promise.reject(new Error('NO_FETCH'));
+    return fetch(url, opts);
+  }
+
+  function request(url, body, apiKey, timeoutMs, epoch) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
+      var tracked = (epoch != null);
+      function untrack() { if (tracked && _inflight && _inflight.xhr === xhr) _inflight = null; }
       xhr.open('POST', url, true);
       xhr.timeout = timeoutMs || 120000;
       xhr.setRequestHeader('Content-Type', 'application/json');
@@ -386,18 +491,21 @@
         xhr.setRequestHeader('api-key', apiKey);
       }
       xhr.onload = function () {
+        untrack();
         var j = null;
         try { j = JSON.parse(xhr.responseText); } catch (e) {}
         if (xhrJsonOk(xhr, j)) resolve(j);
         else reject(new Error(apiErrorMessage(j, xhr.status, xhr.responseText)));
       };
-      xhr.onerror = function () { reject(new Error('网络请求失败（跨域或未走本地代理）')); };
-      xhr.ontimeout = function () { reject(new Error('请求超时')); };
+      xhr.onerror = function () { untrack(); reject(new Error('网络请求失败（跨域或未走本地代理）')); };
+      xhr.ontimeout = function () { untrack(); reject(new Error('请求超时')); };
+      xhr.onabort = function () { untrack(); reject(staleError()); };
+      if (tracked) _inflight = { xhr: xhr, epoch: epoch };
       xhr.send(JSON.stringify(body));
     });
   }
 
-  function requestGet(url, apiKey, timeoutMs) {
+  function requestGet(url, apiKey, timeoutMs, errorMap) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', url, true);
@@ -410,6 +518,7 @@
         var j = null;
         try { j = JSON.parse(xhr.responseText); } catch (e) {}
         if (xhrJsonOk(xhr, j)) resolve(j);
+        else if (errorMap) reject(new Error(errorMap(xhr.status, xhr.responseText, apiKey)));
         else reject(new Error(apiErrorMessage(j, xhr.status, xhr.responseText)));
       };
       xhr.onerror = function () { reject(new Error('网络请求失败（跨域或未走本地代理）')); };
@@ -440,7 +549,54 @@
   }
 
   /* Fish Open API TTS returns audio bytes (or JSON metadata when cache=true). */
-  function requestAudio(url, body, apiKey, timeoutMs) {
+  /* Fish names the engine in a header and rejects a request that cannot work
+     (401/403/429) with a body that may echo the key, so the message is both
+     classified and redacted. `phase` is 'tts' or 'clone'. */
+  function redactSecret(value, secret) {
+    var out = String(value || '');
+    var key = String(secret || '');
+    return key ? out.split(key).join('[redacted]') : out;
+  }
+
+  /* Two sites of the same name are in the wild and users land on the wrong
+     one. fish.audio is the company (docs.fish.audio, api.fish.audio, the free
+     s2.1-pro-free engine); fishaudio.org is a different service that happens
+     to use the same product name — a key minted on fish.audio does not work
+     there. The base URL is never rewritten (a key must not be carried to a
+     host it was not issued for), so the 401/403 message says which one the
+     request went to instead of leaving the user to guess. */
+  function fishHostHint(root) {
+    if (!/fishaudio\.org/i.test(String(root || ''))) return '';
+    return '（注意：fishaudio.org 不是官方站点，官方接口是 https://api.fish.audio——留空即用官方）';
+  }
+
+  function fishErrorMessage(status, raw, apiKey, phase, root) {
+    var label = phase === 'clone' ? '音色创建'
+      : (phase === 'voices' ? '音色列表' : '语音合成');
+    if (status === 401) return 'Fish Audio：API key 无效或缺失（HTTP 401，' + label + '）' + fishHostHint(root);
+    if (status === 403) return 'Fish Audio：权限不足、模型不可用或音色无权访问（HTTP 403，' + label + '）' + fishHostHint(root);
+    if (status === 429) return 'Fish Audio：超出速率或额度限制（HTTP 429，' + label + '）';
+    /* Measured: the API answers 402 not only for a real balance problem but
+       also for an engine that is not free (or a misspelled one) — s2-pro and
+       s1 are paid, an unknown id is "insufficient credit" too. Saying which
+       engine is free is the only actionable half of that message. */
+    if (status === 402) {
+      return 'Fish Audio：这个引擎需要 API 额度（HTTP 402）——免费只有 s2.1-pro-free；'
+           + '付费引擎/写错的引擎名都会报这个。充值入口在 fish.audio 的开发者页。';
+    }
+    var j = null;
+    try { j = JSON.parse(String(raw || '')); } catch (e) {}
+    var detail = redactSecret(apiErrorMessage(j, status, raw), apiKey);
+    /* 400 "Reference not found"：the voice id is not one this account can use
+       (a public voice id copied from somewhere else, or a stale one). */
+    if (status === 400 && /reference not found/i.test(String(raw || ''))) {
+      return 'Fish Audio：音色 ID 无效或不属于这个账号（HTTP 400）——'
+           + '请在 fish.audio 里复制自己音色的 id，或留空用默认音色。';
+    }
+    return 'Fish Audio ' + label + '失败' + (detail ? '：' + detail : '（HTTP ' + status + '）');
+  }
+
+  function requestAudio(url, body, apiKey, timeoutMs, extraHeaders, errorMap) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', url, true);
@@ -451,6 +607,9 @@
         xhr.setRequestHeader('Authorization', 'Bearer ' + apiKey);
         xhr.setRequestHeader('api-key', apiKey);
       }
+      Object.keys(extraHeaders || {}).forEach(function (name) {
+        xhr.setRequestHeader(name, extraHeaders[name]);
+      });
       xhr.onload = function () {
         var buf = xhr.response;
         var ct = xhr.getResponseHeader('Content-Type') || '';
@@ -466,7 +625,9 @@
           Api._downloadUrl(j.audio_url || j.audioUrl, apiKey).then(resolve, reject);
           return;
         }
-        reject(new Error(apiErrorMessage(j, xhr.status, raw)));
+        reject(new Error(errorMap
+          ? errorMap(xhr.status, raw, apiKey)
+          : apiErrorMessage(j, xhr.status, raw)));
       };
       xhr.onerror = function () { reject(new Error('网络请求失败（跨域或未走本地代理）')); };
       xhr.ontimeout = function () { reject(new Error('请求超时')); };
@@ -474,7 +635,7 @@
     });
   }
 
-  function requestForm(url, form, apiKey, timeoutMs) {
+  function requestForm(url, form, apiKey, timeoutMs, errorMap) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', url, true);
@@ -484,7 +645,9 @@
         var j = null;
         try { j = JSON.parse(xhr.responseText); } catch (e) {}
         if (xhrJsonOk(xhr, j)) resolve(j);
-        else reject(new Error(apiErrorMessage(j, xhr.status, xhr.responseText)));
+        else reject(new Error(errorMap
+          ? errorMap(xhr.status, xhr.responseText, apiKey)
+          : apiErrorMessage(j, xhr.status, xhr.responseText)));
       };
       xhr.onerror = function () { reject(new Error('网络请求失败（跨域或未走本地代理）')); };
       xhr.ontimeout = function () { reject(new Error('请求超时')); };
@@ -548,12 +711,37 @@
     return String(url || '').replace(/^http:\/\//i, 'https://');
   }
 
-  /* Fish Audio Open API (https://docs.fishaudio.org). Credentials are
-     separate from openai/qwen so switching providers never mixes keys.
-     fishVoice is a speaker id (莱莎默认音色可改)；fishModel is the engine. */
-  var FISH_DEFAULT_BASE = 'https://fishaudio.org/api/open/v1';
+  /* Fish Audio (https://docs.fish.audio). Credentials are separate from
+     openai/qwen so switching providers never mixes keys.
+
+     Two surfaces are in the wild and users land on different ones:
+       * current        — https://api.fish.audio + POST /v1/tts, engine named
+                          in a `model` header, body {text, reference_id, format}
+       * older Open API — /api/open/v1 + POST /speech/tts, engine named in the
+                          body (voiceId / reference_id / modelId)
+     The base URL now picks the surface. Pasting https://api.fish.audio used to
+     be silently rewritten to the other host, which sent the key somewhere it
+     does not work and surfaced as a confusing failure (issues #6 / #7).
+     fishVoice is a speaker id；fishModel is the engine (per surface).
+
+     The EMPTY field must not fall back to the older host: that host is
+     fishaudio.org, a same-name service that is not the one with the free
+     s2.1-pro-free engine, so "leave it blank and just fill the key" — the
+     most natural thing a user does — landed on a site their key does not
+     belong to (reported again on the 1.2.20 APK). Blank = the official
+     current API now; a legacy deployment still works by typing its URL. */
+  var FISH_MODERN_BASE = 'https://api.fish.audio';
+  var FISH_LEGACY_BASE = 'https://fishaudio.org/api/open/v1';
+  var FISH_DEFAULT_BASE = FISH_MODERN_BASE;
+  var FISH_MODERN_DEFAULT_MODEL = 's2.1-pro-free';
+  var FISH_LEGACY_DEFAULT_MODEL = 'fishaudio-s21pro-flash';
   var FISH_DEFAULT_VOICE = '';
   var FISH_TTS_MODELS = [
+    /* the current API's engines (api.fish.audio, named in the `model` header) */
+    's2.1-pro-free',
+    's2-pro',
+    's1',
+    /* the older Open API's engines (named in the body) */
     'fishaudio-s21pro-flash',
     'fishaudio-s21pro',
     'fishaudio-s2pro',
@@ -569,6 +757,10 @@
     'doubao-tts-2.0'
   ];
 
+  /* Tolerate whatever the settings field was handed: the host root, the
+     documented /v1/tts endpoint, a pasted .../v1, or a legacy /api/open/v1.
+     The surface then follows from the resolved root — it is decided here and
+     nowhere else. */
   function fishApiRoot(baseUrl) {
     var s = String(baseUrl || '').trim();
     if (!s) return FISH_DEFAULT_BASE;
@@ -576,16 +768,35 @@
     s = s.replace(/\/speech\/tts\/jobs$/i, '');
     s = s.replace(/\/speech\/tts$/i, '');
     s = s.replace(/\/v1\/tts$/i, '');
-    if (/api\.fish\.audio/i.test(s)) return FISH_DEFAULT_BASE;
-    if (/^https?:\/\/fishaudio\.org$/i.test(s)) return FISH_DEFAULT_BASE;
-    if (/^https?:\/\/fishaudio\.org\/v1$/i.test(s)) return FISH_DEFAULT_BASE;
+    /* An explicit legacy base wins before the bare /v1 strip below eats it. */
     if (/\/api\/open\/v\d+$/i.test(s)) return s;
+    s = s.replace(/\/v1$/i, '');
+    if (/^https?:\/\/(api\.)?fish\.audio$/i.test(s)) return FISH_MODERN_BASE;
+    if (/^https?:\/\/fishaudio\.org$/i.test(s)) return FISH_LEGACY_BASE;
     if (/fishaudio\.org$/i.test(s)) return s + '/api/open/v1';
     return s;
   }
 
+  /* Which surface a resolved root speaks. Only the decision lives here; the
+     request shape follows from it in _fishSpeak. */
+  function fishApiStyle(root) {
+    return /api\.fish\.audio/i.test(String(root || '')) ? 'modern' : 'legacy';
+  }
+
   function fishTtsUrl(baseUrl) {
-    return fishApiRoot(baseUrl) + '/speech/tts';
+    var root = fishApiRoot(baseUrl);
+    return fishApiStyle(root) === 'modern' ? root + '/v1/tts' : root + '/speech/tts';
+  }
+
+  /* Which voice id a mode speaks with. ASMR has its own id when the user set
+     one (the source ties the whisper register to the outfit; a second hosted
+     voice is the closest a TTS API gets), otherwise the normal one. Empty
+     here means "clone from the local samples" exactly as before. */
+  function fishVoiceFor(tts, mode) {
+    tts = tts || {};
+    var asmr = String(tts.fishVoiceAsmr || '').trim();
+    if (String(mode || '') === 'asmr' && asmr) return asmr;
+    return String(tts.fishVoice || '').trim();
   }
 
   function fishLanguage(lg) {
@@ -604,9 +815,11 @@
     return /minimax/i.test(String(model || ''));
   }
 
-  function fishEmotion() {
-    var e = '';
-    try { e = (window.Avatar && Avatar._emotion) || ''; } catch (err) { e = ''; }
+  /* Fish takes an emotion tag alongside the text. The caller knows the current
+     face (it just set it), so it is passed in — the transport layer must not
+     read renderer state. */
+  function fishEmotion(emotion) {
+    var e = String(emotion || '');
     var map = {
       happy: 'happy', laughing: 'happy', tease: 'surprised',
       shy: 'calm', cuddle: 'calm', sad: 'sad', crying: 'sad',
@@ -981,6 +1194,9 @@
     mapEffort: mapEffort,
     EFFORT_UI: EFFORT_UI,
     setModelMeta: function (m) { _modelMeta = m || null; },
+    /* fn() -> { emotion, attitude } — the host supplies what is on screen, so
+       the protocol layer never reads the render layer. */
+    setScreenState: function (fn) { _screenState = (typeof fn === 'function') ? fn : null; },
     resolvedContext: function () { return resolvedContext(Config.section('llm')); },
     /* test seam: which calls get rewritten onto the same-origin /_proxy
        (nsfw_intent_regression asserts serve.py + ryza://app both route) */
@@ -994,14 +1210,23 @@
     _qwenTtsKind: qwenTtsKind,
     _qwenDefaultVoice: qwenDefaultVoice,
     FISH_DEFAULT_BASE: FISH_DEFAULT_BASE,
+    FISH_MODERN_BASE: FISH_MODERN_BASE,
     FISH_DEFAULT_VOICE: FISH_DEFAULT_VOICE,
     FISH_TTS_MODELS: FISH_TTS_MODELS,
     _fishApiRoot: fishApiRoot,
+    _fishApiStyle: fishApiStyle,
     _fishTtsUrl: fishTtsUrl,
+    _fishVoiceFor: fishVoiceFor,
+    FISH_DEFAULT_BASE: FISH_DEFAULT_BASE,
+    FISH_MODERN_BASE: FISH_MODERN_BASE,
+    FISH_LEGACY_BASE: FISH_LEGACY_BASE,
+    _fishErrorMessage: fishErrorMessage,
     _fishLanguage: fishLanguage,
     _fishSampleUrls: fishSampleUrls,
     /* resolved per-mode TTS voice direction (base hint + mode layer) */
     ttsStyleFor: function (mode) { return ttsStyleFor(mode, Config.section('tts')); },
+    /* speech input: stt.js gets this as an injected port */
+    transcribe: transcribe,
 
     /* resolved reply language (auto = UI) */
     replyLang: function () {
@@ -1033,14 +1258,43 @@
     },
 
     /* ------------------------------------------------------------- LLM */
+    /* ---------------------------------------------------------- turn epoch
+       Turn.newTurn / App own the decision to start a turn; this is the counter
+       and the abort. Kept on Api because aborting the request is a transport
+       concern — turn.js never learns what HTTP is. */
+    turnEpoch: function () { return _epoch; },
+    newTurn: function (reason) { _epoch++; abortInflight(reason); return _epoch; },
+    isStale: function (e) { return e !== _epoch; },
+    abortInflight: abortInflight,
+
     chat: function (history, userText, opts) {
       var llm = Config.section('llm');
       if (!llm.apiKey) return Promise.reject(new Error('NO_KEY'));
       opts = opts || {};
+      /* A side call (dynamically generated quest text, the settings "test LLM"
+         button) must not allocate an epoch. Allocating one aborted whatever the
+         player had in flight, and App.say's own handler treats the resulting
+         STALE as "superseded on purpose" and returns silently — so the player's
+         message disappeared with no answer, no toast and no retry. `standalone`
+         calls are neither tracked nor superseded.
+         No epoch and not standalone (a boot greeting, an alarm line)? Then this
+         call is its own turn and still gets stale protection. */
+      var standalone = opts.standalone === true;
+      var epoch = standalone ? null
+                : ((opts.epoch != null) ? opts.epoch : Api.newTurn());
       var st = Config.section('state');
       var outLang = opts.lang || Api.replyLang();
       var mem = '';
       try { if (window.Memory) mem = Memory.promptBlock() || ''; } catch (e) { mem = ''; }
+      /* 长期记忆（条目 + 摘要）独立于近窗卡片：digest 永远注入，条目按本轮
+         用户说的话做相关度挑选。没有这一层，三个月前的约定就再也想不起来。 */
+      try {
+        if (window.LongTerm) {
+          var lt = LongTerm.promptBlock(opts.cue || '');
+          if (lt) mem = mem ? (mem + String.fromCharCode(10, 10) + lt) : lt;
+
+        }
+      } catch (e) { /* 记忆层不许拖垮对话 */ }
       var system = buildSystemPrompt(opts.mode || st.mode, opts.style || st.style,
                                      opts.rpgContext || '', outLang, opts.nsfwSection || '',
                                      opts.sceneSection || '', mem);
@@ -1069,7 +1323,11 @@
       };
       attachThinking(body, llm, _modelMeta && _modelMeta.id === llm.model ? _modelMeta : null);
       return request(localProxy(upstreamUrl(llm.baseUrl, '/chat/completions')),
-                     body, llm.apiKey).then(function (j) {
+                     body, llm.apiKey, undefined, epoch == null ? undefined : epoch).then(function (j) {
+        /* Interrupted / superseded while the request was in flight: the reply
+           must not reach the caller at all (no history push, no face change,
+           no speech). */
+        if (epoch != null && Api.isStale(epoch)) throw staleError();
         return parseTaggedReply(choiceText(j));
       });
     },
@@ -1140,25 +1398,33 @@
     /* Resolves to a Blob URL. Returns null when voice is disabled.
        provider: 'openai' (chat/completions + audio, MiMo-style),
        'qwen' (DashScope-compatible TTS), or 'fish' (Fish Audio Open API
-       POST /speech/tts, binary audio). `mode` is the talk mode. */
-    speak: function (text, lang, mode) {
+       POST /speech/tts, binary audio). `mode` is the talk mode; `emotion` is
+       the face currently on screen (Fish tags its delivery with it). */
+    speak: function (text, lang, mode, emotion) {
       var tts = Config.section('tts');
       if (tts.mode === 'off') return Promise.resolve(null);
       mode = mode || (Config.section('state') || {}).mode || 'chat';
-      /* Per-provider credentials: qwen has its own baseUrl/apiKey so a MiMo
-         setup can never leak into a DashScope call (or back). */
-      if ((tts.provider || 'openai') === 'qwen') return Api._qwenSpeak(text, lang, mode);
-      if (tts.provider === 'fish') return Api._fishSpeak(text, lang, mode);
+      /* Which credentials belong to which provider is declared in
+         web/js/providers.js and resolved once here. The hand-written
+         per-provider branches were what let a provider switch keep reading the
+         previous endpoint (AUDIT 6.9). */
+      var cred = Providers.credentials(tts);
+      if (cred.capabilities.local) {
+        return Providers.speakLocal(cred, { text: text, fetch: localFetch });
+      }
+      if (cred.id === 'qwen') return Api._qwenSpeak(text, lang, mode);
+      if (cred.id === 'fish') return Api._fishSpeak(text, lang, mode, emotion);
+      if (!cred.apiKey) return Promise.reject(new Error('NO_KEY'));
       if (!tts.apiKey) return Promise.reject(new Error('NO_KEY'));
 
       var audio = { format: tts.format || 'wav' };
       if (tts.mode === 'clone') {
         audio.voice = 'pending';   // filled in below, once the wav is base64'd
       } else {
-        audio.voice = tts.presetVoice || 'Chloe';
+        audio.voice = cred.voice || 'Chloe';
       }
 
-      var model = tts.mode === 'clone' ? tts.modelClone : tts.modelPreset;
+      var model = cred.model;
       /* The shipped defaults are placeholders; sending them yields the
          server's confusing "unsupported model tts-model". Fail locally with
          a clear, translated toast instead. */
@@ -1169,14 +1435,14 @@
 
       function send(voiceField) {
         audio.voice = voiceField;
-        return request(localProxy(upstreamUrl(tts.baseUrl, '/chat/completions')), {
+        return request(localProxy(upstreamUrl(cred.baseUrl, '/chat/completions')), {
           model: model,
           messages: [
             { role: 'user', content: styleHint },
             { role: 'assistant', content: text }
           ],
           audio: audio
-        }, tts.apiKey, 180000).then(function (j) {
+        }, cred.apiKey, 180000).then(function (j) {
           var msg = j.choices && j.choices[0] && j.choices[0].message;
           var data = msg && msg.audio && msg.audio.data;
           if (!data) throw new Error('接口未返回音频');
@@ -1240,36 +1506,71 @@
     },
 
     /* ------------------------------------------- Fish Audio Open API TTS */
-    _fishSpeak: function (text, lang, mode) {
+    _fishSpeak: function (text, lang, mode, emotion) {
       var tts = Config.section('tts');
       if (!tts.fishApiKey) return Promise.reject(new Error('NO_KEY'));
-      function synth(voice) {
-        var model = String(tts.fishModel || 'fishaudio-s21pro-flash').trim() ||
-                    'fishaudio-s21pro-flash';
+      var root = fishApiRoot(tts.fishBaseUrl);
+      var style = fishApiStyle(root);
+
+      function synthModern(voice) {
+        /* Current contract: engine in a header, voice as reference_id, and no
+           instruction/emotion fields — the model does the delivery. */
+        var body = {
+          text: text,
+          format: (tts.format === 'mp3') ? 'mp3' : 'wav'
+        };
+        if (voice) body.reference_id = voice;
+        var model = String(tts.fishModel || '').trim() || FISH_MODERN_DEFAULT_MODEL;
+        return requestAudio(localProxy(fishTtsUrl(tts.fishBaseUrl)), body, tts.fishApiKey, 180000,
+                            { model: model },
+                            function (st, raw, key) { return fishErrorMessage(st, raw, key, 'tts', root); });
+      }
+
+      function synthLegacy(voice) {
+        var model = String(tts.fishModel || '').trim() || FISH_LEGACY_DEFAULT_MODEL;
         var lg = lang || (window.Langs ? Langs.tts() : 'ja');
-        var fmt = (tts.format === 'mp3') ? 'mp3' : 'wav';
         var body = {
           text: text,
           voiceId: voice,
           reference_id: voice,
           modelId: model,
-          format: fmt
+          format: (tts.format === 'mp3') ? 'mp3' : 'wav'
         };
         var fishLang = fishLanguage(lg);
         if (fishLang) body.language = fishLang;
         if (fishWantsInstruction(model)) {
-          var style = ttsStyleFor(mode || 'chat', tts);
-          if (style) body.instruction = style;
+          var styleHint = ttsStyleFor(mode || 'chat', tts);
+          if (styleHint) body.instruction = styleHint;
         }
         if (fishWantsEmotion(model)) {
-          var emo = fishEmotion();
+          var emo = fishEmotion(emotion);
           if (emo) body.emotion = emo;
         }
-        return requestAudio(localProxy(fishTtsUrl(tts.fishBaseUrl)), body, tts.fishApiKey, 180000);
+        return requestAudio(localProxy(fishTtsUrl(tts.fishBaseUrl)), body, tts.fishApiKey, 180000,
+                            null,
+                            function (st, raw, key) { return fishErrorMessage(st, raw, key, 'tts', root); });
       }
-      var voice = String(tts.fishVoice || '').trim();
+
+      var synth = style === 'modern' ? synthModern : synthLegacy;
+      var voice = fishVoiceFor(tts, mode);
       if (voice) return synth(voice);
-      if (_fishCloneWait) return _fishCloneWait.then(synth);
+
+      /* Empty voice on the CURRENT API is a working configuration: POST
+         /v1/tts with the free engine and no reference_id answers with audio
+         (measured live, 2026-09-21), Fish picks a default voice. Refusing here
+         — which is what this used to do — made "paste the key, leave the rest
+         blank" impossible on the very surface we recommend. */
+      if (style === 'modern') return synth('');
+
+      /* Auto-clone uploads local samples through the older Open API. */
+      /* The clone runs first, so the voice id has to be read again afterwards:
+         the resolved id lives in Config now, not in the snapshot above. */
+      function synthAfterClone() {
+        var now = {};
+        try { now = Config.section('tts'); } catch (e) { now = tts; }
+        return synth(fishVoiceFor(now, mode));
+      }
+      if (_fishCloneWait) return _fishCloneWait.then(synthAfterClone);
       _fishCloneWait = Api.fishCloneVoice().then(function (vid) {
         try { Config.set('tts.fishVoice', vid); } catch (e) {}
         _fishCloneWait = null;
@@ -1278,21 +1579,28 @@
         _fishCloneWait = null;
         throw err;
       });
-      return _fishCloneWait.then(synth);
+      return _fishCloneWait.then(synthAfterClone);
     },
 
     listFishVoices: function () {
       var tts = Config.section('tts');
       if (!tts.fishApiKey) return Promise.reject(new Error('NO_KEY'));
       var root = fishApiRoot(tts.fishBaseUrl);
-      return requestGet(localProxy(root + '/voices?pageSize=100&includePersonal=true'),
-                        tts.fishApiKey, 20000)
+      /* Two shapes again: the older Open API lists /voices with voiceId, the
+         current one lists /model with _id (verified: it answers publicly with
+         {items:[{_id,title,languages,…}]}). Both end up as {id,title}. */
+      var modern = fishApiStyle(root) === 'modern';
+      var url = modern
+        ? root + '/model?page_size=100&page_number=1'
+        : root + '/voices?pageSize=100&includePersonal=true';
+      return requestGet(localProxy(url), tts.fishApiKey, 20000,
+                       function (st, raw, key) { return fishErrorMessage(st, raw, key, 'voices', root); })
         .then(function (j) {
           var items = (j && j.items) || [];
           var out = [], seen = {};
           items.forEach(function (it) {
             if (!it) return;
-            var id = it.voiceId || it.voice_id || it.id;
+            var id = it.voiceId || it.voice_id || it.id || it._id;
             if (!id || seen[id]) return;
             seen[id] = 1;
             out.push({ id: id, title: it.title || it.name || id });
@@ -1304,6 +1612,14 @@
     fishCloneVoice: function () {
       var tts = Config.section('tts');
       if (!tts.fishApiKey) return Promise.reject(new Error('NO_KEY'));
+      /* The current API builds a voice from /file + /model and needs the account
+         to own it; uploading local samples is only the older Open API's move.
+         Refusing with the next step beats a 404 from a path that does not exist
+         there. */
+      if (fishApiStyle(fishApiRoot(tts.fishBaseUrl)) === 'modern') {
+        return Promise.reject(new Error(
+          'Fish Audio（api.fish.audio）不支持本地样本自动克隆——请在 fish.audio 里创建音色，把它的 id 填到「Fish 音色」'));
+      }
       return Promise.all(fishSampleUrls().map(function (url) {
         return fetch(url).then(function (r) {
           if (!r.ok) return null;
@@ -1326,7 +1642,10 @@
         fd.append('languages', JSON.stringify(['ja', 'zh', 'en']));
         files.forEach(function (f) { fd.append('audioFiles', f.blob, f.name); });
         return requestForm(localProxy(fishApiRoot(tts.fishBaseUrl) + '/voices'),
-                           fd, tts.fishApiKey, 180000);
+                           fd, tts.fishApiKey, 180000,
+                           function (st, raw, key) {
+                             return fishErrorMessage(st, raw, key, 'clone', fishApiRoot(tts.fishBaseUrl));
+                           });
       }).then(function (j) {
         var vid = j && (j.voiceId || j.voice_id);
         if (!vid) throw new Error(apiErrorMessage(j, 200, '') || '未返回 voiceId');

@@ -48,6 +48,10 @@ public final class AssetServer extends Thread {
         MIME.put("m4a", "audio/mp4");
         MIME.put("wav", "audio/wav");
         MIME.put("mp3", "audio/mpeg");
+        // WebAssembly + ES modules: without these Chromium refuses to import the
+        // module (strict MIME check on .mjs) or to instantiate the .wasm stream.
+        MIME.put("mjs", "application/javascript; charset=utf-8");
+        MIME.put("wasm", "application/wasm");
         MIME.put("ttf", "font/ttf");
         MIME.put("woff", "font/woff");
         MIME.put("woff2", "font/woff2");
@@ -90,7 +94,7 @@ public final class AssetServer extends Thread {
             Headers hs = readHeaders(in);
             if ("OPTIONS".equals(method)) {
                 writeBytes(out, 204, "text/plain", new byte[0],
-                    "Access-Control-Allow-Headers: Authorization, Content-Type, api-key\r\n" +
+                    "Access-Control-Allow-Headers: Authorization, Content-Type, api-key, model\r\n" +
                     "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n");
                 return;
             }
@@ -131,6 +135,10 @@ public final class AssetServer extends Thread {
         String contentType = "application/json";
         String authorization = null;
         String apiKey = null;
+        /** Fish Audio names its engine in a `model` header (the older surface
+         *  named it in the body) — dropping it made every Fish request answer
+         *  402 "Insufficient API credit". */
+        String model = null;
     }
 
     private Headers readHeaders(InputStream in) throws IOException {
@@ -146,6 +154,7 @@ public final class AssetServer extends Thread {
             else if ("content-type".equals(k)) h.contentType = v;
             else if ("authorization".equals(k)) h.authorization = v;
             else if ("api-key".equals(k)) h.apiKey = v;
+            else if ("model".equals(k)) h.model = v;
         }
         return h;
     }
@@ -172,8 +181,9 @@ public final class AssetServer extends Thread {
                 off += n;
             }
         }
-        if (!target.startsWith("https://")) {
-            write(out, 400, "application/json", "{\"error\":{\"message\":\"proxy target must be https\"}}");
+        if (!proxyTargetAllowed(target)) {
+            write(out, 400, "application/json",
+                  "{\"error\":{\"message\":\"proxy target must be https (or http on loopback)\"}}");
             return;
         }
         try {
@@ -183,9 +193,10 @@ public final class AssetServer extends Thread {
             up.setReadTimeout(180000);
             up.setDoOutput(true);
             up.setRequestProperty("Content-Type", hs.contentType);
-            up.setRequestProperty("User-Agent", "RyzaChat/1.2.13");
+            up.setRequestProperty("User-Agent", "RyzaChat/1.2.21");
             if (hs.authorization != null) up.setRequestProperty("Authorization", hs.authorization);
             if (hs.apiKey != null) up.setRequestProperty("api-key", hs.apiKey);
+            if (hs.model != null) up.setRequestProperty("model", hs.model);
             if (body.length > 0) {
                 OutputStream ub = up.getOutputStream();
                 ub.write(body);
@@ -216,8 +227,9 @@ public final class AssetServer extends Thread {
                 }
             }
         }
-        if (!target.startsWith("https://")) {
-            write(out, 400, "application/json", "{\"error\":{\"message\":\"proxy target must be https\"}}");
+        if (!proxyTargetAllowed(target)) {
+            write(out, 400, "application/json",
+                  "{\"error\":{\"message\":\"proxy target must be https (or http on loopback)\"}}");
             return;
         }
         try {
@@ -226,9 +238,10 @@ public final class AssetServer extends Thread {
             up.setConnectTimeout(20000);
             up.setReadTimeout(120000);
             up.setInstanceFollowRedirects(true);
-            up.setRequestProperty("User-Agent", "RyzaChat/1.2.13");
+            up.setRequestProperty("User-Agent", "RyzaChat/1.2.21");
             if (hs != null && hs.authorization != null) up.setRequestProperty("Authorization", hs.authorization);
             if (hs != null && hs.apiKey != null) up.setRequestProperty("api-key", hs.apiKey);
+            if (hs != null && hs.model != null) up.setRequestProperty("model", hs.model);
             int code = up.getResponseCode();
             InputStream is = code >= 400 ? up.getErrorStream() : up.getInputStream();
             byte[] resp = is == null ? new byte[0] : readAll(is);
@@ -237,6 +250,48 @@ public final class AssetServer extends Thread {
             writeBytes(out, code, ct, resp, "");
         } catch (IOException e) {
             write(out, 502, "application/json", "{\"error\":{\"message\":\"proxy get failed\"}}");
+        }
+    }
+
+    /**
+     * Loopback = 127.0.0.0/8, ::1, localhost — and nothing else. A prefix test
+     * on "127." would also wave through `127.0.0.1.evil.com`, a public name,
+     * so this parses the dotted quad instead of matching a string prefix.
+     */
+    private static boolean isLoopbackHost(String host) {
+        if (host == null) return false;
+        String h = host.trim().toLowerCase(Locale.ROOT);
+        if (h.startsWith("[") && h.endsWith("]")) h = h.substring(1, h.length() - 1);
+        if (h.equals("localhost") || h.equals("::1")) return true;
+        String[] parts = h.split("\\.", -1);
+        if (parts.length != 4 || !parts[0].equals("127")) return false;
+        for (int i = 1; i < 4; i++) {
+            if (parts[i].isEmpty() || parts[i].length() > 3) return false;
+            for (int j = 0; j < parts[i].length(); j++) {
+                if (!Character.isDigit(parts[i].charAt(j))) return false;
+            }
+            if (Integer.parseInt(parts[i]) > 255) return false;
+        }
+        return true;
+    }
+
+    /**
+     * https anywhere, http only on loopback.
+     *
+     * The https rule exists so an API key never crosses the network in clear.
+     * A loopback target never crosses the network: Ollama / LM Studio on the
+     * operator's own machine, so refusing them broke the local-first setup
+     * this client is built around. Everything not loopback still needs https.
+     * Same rule in scripts/serve.py and desktop/main.js.
+     */
+    private static boolean proxyTargetAllowed(String target) {
+        try {
+            java.net.URI u = java.net.URI.create(target);
+            String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
+            if (scheme.equals("https")) return true;
+            return scheme.equals("http") && isLoopbackHost(u.getHost());
+        } catch (Exception e) {
+            return false;
         }
     }
 

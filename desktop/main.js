@@ -48,6 +48,14 @@ const MIME = {
   '.atlas': 'text/plain; charset=utf-8', '.skel': 'application/octet-stream',
   '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav',
   '.mp3': 'audio/mpeg', '.ttf': 'font/ttf', '.otf': 'font/otf',
+  /* WebAssembly + ES modules. Missing these is not cosmetic: Chromium's
+     strict module MIME check refuses to import an .mjs served as
+     application/octet-stream, and instantiateStreaming refuses a .wasm
+     served as anything but application/wasm. Measured: onnxruntime-web
+     hard-fails on this host with the two entries below missing, and runs
+     clean with them present. */
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.wasm': 'application/wasm',
   '.woff': 'font/woff', '.woff2': 'font/woff2'
 };
 
@@ -68,17 +76,28 @@ function jsonError(status, message) {
   });
 }
 
+/* https anywhere, http only on loopback — the rule and its rationale live in
+   desktop/proxy-target.js (issue #5), which is also listed in
+   package.json's `files` so the packaged shell can require it. */
+const { proxyTargetAllowed } = require('./proxy-target');
+
 async function proxyRequest(request, targetUrl) {
-  if (!String(targetUrl || '').startsWith('https://')) {
-    return jsonError(400, 'proxy target must be https');
+  if (!proxyTargetAllowed(targetUrl)) {
+    return jsonError(400, 'proxy target must be https (or http on loopback)');
   }
-  const headers = { 'User-Agent': 'RyzaChat/1.2.13' };
+  const headers = { 'User-Agent': 'RyzaChat/1.2.21' };
   const ct = request.headers.get('content-type');
   const auth = request.headers.get('authorization');
   const apiKey = request.headers.get('api-key');
+  /* The current Fish Audio API names its engine in a `model` header (the older
+     surface named it in the body). Forwarding only Authorization dropped it,
+     and Fish then answered 402 "Insufficient API credit" for every request
+     this shell made — same contract as serve.py and the Android AssetServer. */
+  const model = request.headers.get('model');
   if (ct) headers['Content-Type'] = ct;
   if (auth) headers.Authorization = auth;
   if (apiKey) headers['api-key'] = apiKey;
+  if (model) headers.model = model;
   const init = { method: request.method, headers };
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     init.body = Buffer.from(await request.arrayBuffer());
